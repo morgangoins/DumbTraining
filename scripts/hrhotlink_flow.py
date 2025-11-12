@@ -11,12 +11,14 @@ from playwright.async_api import (
 
 LOGIN_URL = "https://www.hrhotlink.com/home.asp?xu=WQL40829&xt=046F526A7A7772"
 USERNAME = "mgoins"
-PASSWORD = "4Marshall"
+PASSWORD = "4Marshall,"
 
 TWO_FACTOR_INPUT_SELECTORS = [
+    "#Code",
     "#TwoFactorCode",
     "input[name='TwoFactorCode']",
     "input[name='twoFactorCode']",
+    "input[name='Code']",
     "input[name='VerificationCode']",
     "input[name='verificationCode']",
     "input[placeholder*='code' i]",
@@ -24,9 +26,9 @@ TWO_FACTOR_INPUT_SELECTORS = [
 ]
 
 TWO_FACTOR_SUBMIT_SELECTORS = [
+    "button:has-text('Continue')",
     "button:has-text('Verify')",
     "button:has-text('Submit')",
-    "button:has-text('Continue')",
     "input[type='submit']",
 ]
 
