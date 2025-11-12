@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import time
 from typing import Optional
 
 from playwright.async_api import (
@@ -34,18 +35,37 @@ TWO_FACTOR_SUBMIT_SELECTORS = [
 
 
 async def wait_for_training_link(page: Page, timeout_ms: int = 7000) -> bool:
-    locators = [
-        page.get_by_role("link", name="Training"),
-        page.locator("a:has-text('Training')"),
-        page.locator("text=Training"),
-    ]
+    poll_interval = 0.4
+    deadline = time.monotonic() + timeout_ms / 1000
 
-    for locator in locators:
-        try:
-            await locator.first.wait_for(timeout=timeout_ms)
-            return True
-        except PlaywrightTimeoutError:
-            continue
+    def iter_frames():
+        # Ensure the main frame is checked first.
+        seen = set()
+        main = page.main_frame
+        if main:
+            seen.add(main)
+            yield main
+        for frame in page.frames:
+            if frame in seen:
+                continue
+            yield frame
+
+    while time.monotonic() < deadline:
+        for frame in iter_frames():
+            locators = [
+                frame.get_by_role("link", name="Training"),
+                frame.locator("a:has-text('Training')"),
+                frame.locator("text=Training"),
+            ]
+
+            for locator in locators:
+                try:
+                    if await locator.count():
+                        print("Detected 'Training' link; assuming post-login state reached.")
+                        return True
+                except PlaywrightTimeoutError:
+                    continue
+        await asyncio.sleep(poll_interval)
 
     return False
 
