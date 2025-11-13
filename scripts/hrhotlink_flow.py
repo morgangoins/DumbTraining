@@ -35,40 +35,122 @@ TWO_FACTOR_SUBMIT_SELECTORS = [
     "input[type='submit']",
 ]
 
+TWO_FACTOR_ERROR_SELECTORS = [
+    "text=/invalid\\s+(verification|two[- ]?factor)\\s+code/i",
+    "text=/incorrect\\s+(verification|two[- ]?factor)\\s+code/i",
+    "text=/verification\\s+code\\s+is\\s+required/i",
+    "text=/two[- ]?factor\\s+(verification|authentication)\\s+failed/i",
+]
+
+
+def iter_page_frames(page: Page):
+    seen = set()
+    main = page.main_frame
+    if main:
+        seen.add(main)
+        yield main
+    for frame in page.frames:
+        if frame in seen:
+            continue
+        yield frame
+
+
+async def training_link_present(page: Page) -> bool:
+    locators_factories = [
+        lambda frame: frame.get_by_role("link", name="Training"),
+        lambda frame: frame.locator("a:has-text('Training')"),
+        lambda frame: frame.locator("text=Training"),
+    ]
+
+    for frame in iter_page_frames(page):
+        for factory in locators_factories:
+            locator = factory(frame)
+            try:
+                if await locator.count():
+                    return True
+            except PlaywrightTimeoutError:
+                continue
+            except Exception:
+                continue
+
+    return False
+
 
 async def wait_for_training_link(page: Page, timeout_ms: int = 7000) -> bool:
     poll_interval = 0.4
     deadline = time.monotonic() + timeout_ms / 1000
 
-    def iter_frames():
-        # Ensure the main frame is checked first.
-        seen = set()
-        main = page.main_frame
-        if main:
-            seen.add(main)
-            yield main
-        for frame in page.frames:
-            if frame in seen:
-                continue
-            yield frame
-
     while time.monotonic() < deadline:
-        for frame in iter_frames():
-            locators = [
-                frame.get_by_role("link", name="Training"),
-                frame.locator("a:has-text('Training')"),
-                frame.locator("text=Training"),
-            ]
-
-            for locator in locators:
-                try:
-                    if await locator.count():
-                        print("Detected 'Training' link; assuming post-login state reached.")
-                        return True
-                except PlaywrightTimeoutError:
-                    continue
+        if await training_link_present(page):
+            print("Detected 'Training' link; assuming post-login state reached.")
+            return True
         await asyncio.sleep(poll_interval)
 
+    return False
+
+
+async def wait_for_two_factor_transition(
+    page: Page, input_selector: str, timeout_ms: int = 17000
+) -> bool:
+    poll_interval = 0.4
+    deadline = time.monotonic() + timeout_ms / 1000
+    initial_url = page.url
+    navigation_logged = False
+
+    while time.monotonic() < deadline:
+        if await training_link_present(page):
+            print("Detected 'Training' link after submitting two-factor code; verification succeeded.")
+            return True
+
+        current_url = page.url
+        if current_url != initial_url and not navigation_logged:
+            print(f"Navigation changed from '{initial_url}' to '{current_url}' after submitting 2FA code.")
+            navigation_logged = True
+
+        input_locator = page.locator(input_selector)
+        try:
+            input_count = await input_locator.count()
+        except PlaywrightTimeoutError:
+            input_count = 0
+        except Exception:
+            input_count = 0
+
+        if input_count == 0:
+            print("Two-factor input removed from DOM; assuming verification succeeded.")
+            return True
+
+        try:
+            if not await input_locator.first.is_visible():
+                print("Two-factor input hidden from view; assuming verification succeeded.")
+                return True
+        except PlaywrightTimeoutError:
+            pass
+        except Exception:
+            pass
+
+        for error_selector in TWO_FACTOR_ERROR_SELECTORS:
+            error_locator = page.locator(error_selector)
+            try:
+                if await error_locator.count():
+                    try:
+                        if await error_locator.first.is_visible():
+                            message = (await error_locator.first.inner_text()).strip()
+                            if message:
+                                print(f"Detected two-factor error message: '{message}'")
+                            else:
+                                print("Detected a visible two-factor error indicator on the page.")
+                            return False
+                    except PlaywrightTimeoutError:
+                        continue
+                    except Exception:
+                        print("Detected a two-factor error indicator on the page.")
+                        return False
+            except PlaywrightTimeoutError:
+                continue
+
+        await asyncio.sleep(poll_interval)
+
+    print("No post-login indicators detected after submitting two-factor code.")
     return False
 
 
@@ -107,7 +189,7 @@ async def maybe_handle_two_factor(page: Page, login_attempt: int) -> bool:
             if not submitted:
                 print("No obvious submit button found for 2FA; waiting for page to react.")
 
-            if await wait_for_training_link(page, timeout_ms=12000):
+            if await wait_for_two_factor_transition(page, selector, timeout_ms=20000):
                 print("Two-factor verification succeeded.")
                 return True
 
