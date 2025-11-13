@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import contextlib
 import re
 import time
 from typing import Optional
@@ -178,6 +179,47 @@ async def click_first_available(page: Page, description: str, locator_factories,
     raise RuntimeError(f"Unable to locate {description} within {timeout_ms} ms.")
 
 
+async def click_with_optional_popup(
+    page: Page,
+    description: str,
+    locator_factories,
+    click_timeout_ms: int = 7000,
+    popup_timeout_ms: int = 8000,
+) -> Page:
+    popup_task: Optional[asyncio.Task[Page]] = asyncio.create_task(page.wait_for_event("popup"))
+
+    try:
+        await click_first_available(page, description, locator_factories, timeout_ms=click_timeout_ms)
+    except Exception:
+        if popup_task:
+            popup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await popup_task
+        raise
+
+    if not popup_task:
+        return page
+
+    try:
+        new_page = await asyncio.wait_for(popup_task, popup_timeout_ms / 1000)
+    except asyncio.TimeoutError:
+        popup_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await popup_task
+        return page
+    except Exception as exc:
+        if not isinstance(exc, PlaywrightTimeoutError):
+            print(f"Waiting for popup after clicking {description} raised: {exc}")
+        return page
+    else:
+        try:
+            await new_page.wait_for_load_state("domcontentloaded", timeout=popup_timeout_ms)
+        except PlaywrightTimeoutError:
+            pass
+        print(f"{description} opened a new page; switching context.")
+        return new_page
+
+
 async def navigate_to_anti_harassment_training(page: Page) -> None:
     print("Navigating to Training menu...")
     training_locators = [
@@ -186,13 +228,19 @@ async def navigate_to_anti_harassment_training(page: Page) -> None:
         lambda frame: frame.locator("text=Training"),
         lambda frame: frame.locator("text=/Training/i"),
     ]
-    await click_first_available(page, "Training link", training_locators)
+    active_page = await click_with_optional_popup(
+        page,
+        "Training link",
+        training_locators,
+        click_timeout_ms=15000,
+        popup_timeout_ms=12000,
+    )
 
     try:
-        await page.wait_for_load_state("networkidle", timeout=5000)
+        await active_page.wait_for_load_state("networkidle", timeout=7000)
     except PlaywrightTimeoutError:
         pass
-    await page.wait_for_timeout(1000)
+    await active_page.wait_for_timeout(1000)
 
     print("Opening Anti-Harassment Employee Training module...")
     anti_harassment_locators = [
@@ -203,18 +251,20 @@ async def navigate_to_anti_harassment_training(page: Page) -> None:
         lambda frame: frame.locator("text=/Anti-Harassment/i"),
         lambda frame: frame.locator("button:has-text('Anti-Harassment Employee Training')"),
     ]
-    await click_first_available(
-        page,
+    active_page = await click_with_optional_popup(
+        active_page,
         "'Anti-Harassment Employee Training' option",
         anti_harassment_locators,
         timeout_ms=15000,
+        popup_timeout_ms=15000,
     )
 
     try:
-        await page.wait_for_load_state("networkidle", timeout=5000)
+        await active_page.wait_for_load_state("networkidle", timeout=7000)
     except PlaywrightTimeoutError:
         pass
     print("Anti-Harassment Employee Training should now be open.")
+    return active_page
 
 
 async def run(headless: bool, slow_mo: int) -> None:
@@ -226,10 +276,10 @@ async def run(headless: bool, slow_mo: int) -> None:
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
 
         await submit_login(page)
-        await navigate_to_anti_harassment_training(page)
+        active_page = await navigate_to_anti_harassment_training(page)
 
         print("Automation steps completed. Leaving the browser open for review...")
-        await page.wait_for_timeout(5000)
+        await active_page.wait_for_timeout(5000)
         await browser.close()
 
 
