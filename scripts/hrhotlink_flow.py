@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import re
 import time
 from typing import Optional
 
@@ -144,25 +145,76 @@ async def submit_login(page: Page, max_attempts: int = 3) -> None:
     raise RuntimeError(last_error or "Unable to log in after multiple attempts.")
 
 
-async def navigate_to_required_training(page: Page) -> None:
-    print("Navigating to Training...")
+async def click_first_available(page: Page, description: str, locator_factories, timeout_ms: int = 7000) -> None:
+    poll_interval = 0.4
+    deadline = time.monotonic() + timeout_ms / 1000
+
+    def iter_frames():
+        seen = set()
+        main_frame = page.main_frame
+        if main_frame:
+            seen.add(main_frame)
+            yield main_frame
+        for frame in page.frames:
+            if frame in seen:
+                continue
+            yield frame
+
+    while time.monotonic() < deadline:
+        for frame in iter_frames():
+            for factory in locator_factories:
+                locator = factory(frame)
+                try:
+                    await locator.first.click(timeout=500)
+                    print(f"Clicked {description}.")
+                    return
+                except PlaywrightTimeoutError:
+                    continue
+                except Exception as exc:
+                    print(f"Locator attempt for {description} failed: {exc}")
+                    continue
+        await asyncio.sleep(poll_interval)
+
+    raise RuntimeError(f"Unable to locate {description} within {timeout_ms} ms.")
+
+
+async def navigate_to_anti_harassment_training(page: Page) -> None:
+    print("Navigating to Training menu...")
+    training_locators = [
+        lambda frame: frame.get_by_role("link", name=re.compile("Training", re.IGNORECASE)),
+        lambda frame: frame.locator("a:has-text('Training')"),
+        lambda frame: frame.locator("text=Training"),
+        lambda frame: frame.locator("text=/Training/i"),
+    ]
+    await click_first_available(page, "Training link", training_locators)
+
     try:
-        await page.get_by_role("link", name="Training").first.click()
+        await page.wait_for_load_state("networkidle", timeout=5000)
     except PlaywrightTimeoutError:
-        await page.locator("a:has-text('Training')").first.click()
+        pass
+    await page.wait_for_timeout(1000)
 
-    await page.wait_for_load_state("networkidle")
+    print("Opening Anti-Harassment Employee Training module...")
+    anti_harassment_locators = [
+        lambda frame: frame.get_by_role("link", name=re.compile("Anti-Harassment Employee Training", re.IGNORECASE)),
+        lambda frame: frame.locator("a:has-text('Anti-Harassment Employee Training')"),
+        lambda frame: frame.locator("text=Anti-Harassment Employee Training"),
+        lambda frame: frame.locator("text=/Anti-Harassment\\s+Employee\\s+Training/i"),
+        lambda frame: frame.locator("text=/Anti-Harassment/i"),
+        lambda frame: frame.locator("button:has-text('Anti-Harassment Employee Training')"),
+    ]
+    await click_first_available(
+        page,
+        "'Anti-Harassment Employee Training' option",
+        anti_harassment_locators,
+        timeout_ms=15000,
+    )
 
-    print("Navigating to Required Training...")
-    # Try the most accessible locator first (link role)
     try:
-        await page.get_by_role("link", name="Required Training").first.click()
+        await page.wait_for_load_state("networkidle", timeout=5000)
     except PlaywrightTimeoutError:
-        # Fallback to text locator if ARIA role lookup fails
-        await page.locator("text=Required Training").first.click()
-
-    await page.wait_for_load_state("networkidle")
-    print("Arrived on Required Training page (or navigation triggered).")
+        pass
+    print("Anti-Harassment Employee Training should now be open.")
 
 
 async def run(headless: bool, slow_mo: int) -> None:
@@ -174,7 +226,7 @@ async def run(headless: bool, slow_mo: int) -> None:
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
 
         await submit_login(page)
-        await navigate_to_required_training(page)
+        await navigate_to_anti_harassment_training(page)
 
         print("Automation steps completed. Leaving the browser open for review...")
         await page.wait_for_timeout(5000)
