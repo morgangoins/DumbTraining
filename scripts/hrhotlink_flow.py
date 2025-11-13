@@ -9,6 +9,7 @@ from playwright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
     Browser,
+    Frame,
     Page,
 )
 
@@ -58,8 +59,11 @@ def iter_page_frames(page: Page):
 async def training_link_present(page: Page) -> bool:
     locators_factories = [
         lambda frame: frame.get_by_role("link", name="Training"),
+        lambda frame: frame.get_by_role("menuitem", name=re.compile("Training", re.IGNORECASE)),
+        lambda frame: frame.get_by_role("button", name=re.compile("Training", re.IGNORECASE)),
         lambda frame: frame.locator("a:has-text('Training')"),
         lambda frame: frame.locator("text=Training"),
+        lambda frame: frame.locator("text=/Training/i"),
     ]
 
     for frame in iter_page_frames(page):
@@ -76,7 +80,7 @@ async def training_link_present(page: Page) -> bool:
     return False
 
 
-async def wait_for_training_link(page: Page, timeout_ms: int = 7000) -> bool:
+async def wait_for_training_link(page: Page, timeout_ms: int = 20000) -> bool:
     poll_interval = 0.4
     deadline = time.monotonic() + timeout_ms / 1000
 
@@ -90,7 +94,7 @@ async def wait_for_training_link(page: Page, timeout_ms: int = 7000) -> bool:
 
 
 async def wait_for_two_factor_transition(
-    page: Page, input_selector: str, timeout_ms: int = 17000
+    page: Page, challenge_frame: Optional[Frame], input_selector: str, timeout_ms: int = 17000
 ) -> bool:
     poll_interval = 0.4
     deadline = time.monotonic() + timeout_ms / 1000
@@ -107,7 +111,33 @@ async def wait_for_two_factor_transition(
             print(f"Navigation changed from '{initial_url}' to '{current_url}' after submitting 2FA code.")
             navigation_logged = True
 
-        input_locator = page.locator(input_selector)
+        frame_alive = False
+        frame_to_inspect: Optional[Frame] = None
+        if challenge_frame:
+            try:
+                frame_alive = not challenge_frame.is_detached()
+            except AttributeError:
+                frame_alive = True
+            except Exception:
+                frame_alive = False
+
+            if frame_alive:
+                for frame in page.frames:
+                    if frame == challenge_frame:
+                        frame_to_inspect = frame
+                        break
+            else:
+                frame_to_inspect = None
+
+        if challenge_frame and not frame_alive:
+            print("Two-factor frame is no longer present; assuming verification succeeded.")
+            return True
+
+        if frame_to_inspect is None:
+            frame_to_inspect = page.main_frame
+
+        input_locator = frame_to_inspect.locator(input_selector) if frame_to_inspect else page.locator(input_selector)
+
         try:
             input_count = await input_locator.count()
         except PlaywrightTimeoutError:
@@ -120,33 +150,78 @@ async def wait_for_two_factor_transition(
             return True
 
         try:
-            if not await input_locator.first.is_visible():
+            first_input = input_locator.first
+        except Exception:
+            first_input = None
+
+        if first_input:
+            try:
+                visible = await first_input.is_visible()
+            except PlaywrightTimeoutError:
+                visible = False
+            except Exception:
+                visible = False
+
+            if not visible:
                 print("Two-factor input hidden from view; assuming verification succeeded.")
                 return True
-        except PlaywrightTimeoutError:
-            pass
-        except Exception:
-            pass
+
+            try:
+                editable = await first_input.is_editable()
+            except PlaywrightTimeoutError:
+                editable = False
+            except Exception:
+                editable = False
+
+            if not editable:
+                print("Two-factor input is no longer editable; assuming verification succeeded.")
+                return True
+
+            try:
+                enabled = await first_input.is_enabled()
+            except PlaywrightTimeoutError:
+                enabled = False
+            except Exception:
+                enabled = False
+
+            if not enabled:
+                print("Two-factor input disabled; assuming verification succeeded.")
+                return True
+
+            try:
+                attr_readonly = await first_input.get_attribute("readonly")
+                attr_disabled = await first_input.get_attribute("disabled")
+            except PlaywrightTimeoutError:
+                attr_readonly = None
+                attr_disabled = None
+            except Exception:
+                attr_readonly = None
+                attr_disabled = None
+
+            if attr_readonly is not None or attr_disabled is not None:
+                print("Two-factor input reports readonly/disabled attributes; assuming verification succeeded.")
+                return True
 
         for error_selector in TWO_FACTOR_ERROR_SELECTORS:
-            error_locator = page.locator(error_selector)
-            try:
-                if await error_locator.count():
-                    try:
-                        if await error_locator.first.is_visible():
-                            message = (await error_locator.first.inner_text()).strip()
-                            if message:
-                                print(f"Detected two-factor error message: '{message}'")
-                            else:
-                                print("Detected a visible two-factor error indicator on the page.")
+            for frame in iter_page_frames(page):
+                error_locator = frame.locator(error_selector)
+                try:
+                    if await error_locator.count():
+                        try:
+                            if await error_locator.first.is_visible():
+                                message = (await error_locator.first.inner_text()).strip()
+                                if message:
+                                    print(f"Detected two-factor error message: '{message}'")
+                                else:
+                                    print("Detected a visible two-factor error indicator on the page.")
+                                return False
+                        except PlaywrightTimeoutError:
+                            continue
+                        except Exception:
+                            print("Detected a two-factor error indicator on the page.")
                             return False
-                    except PlaywrightTimeoutError:
-                        continue
-                    except Exception:
-                        print("Detected a two-factor error indicator on the page.")
-                        return False
-            except PlaywrightTimeoutError:
-                continue
+                except PlaywrightTimeoutError:
+                    continue
 
         await asyncio.sleep(poll_interval)
 
@@ -162,41 +237,63 @@ async def prompt_for_two_factor_code(login_attempt: int, code_attempt: int) -> s
 
 async def maybe_handle_two_factor(page: Page, login_attempt: int) -> bool:
     for selector in TWO_FACTOR_INPUT_SELECTORS:
-        field = page.locator(selector)
-        try:
-            await field.first.wait_for(timeout=2500)
-        except PlaywrightTimeoutError:
-            continue
+        for frame in iter_page_frames(page):
+            field_locator = frame.locator(selector)
+            try:
+                await field_locator.first.wait_for(state="visible", timeout=2500)
+            except PlaywrightTimeoutError:
+                continue
+            except Exception:
+                continue
 
-        print(f"Two-factor challenge detected using selector '{selector}'.")
+            frame_descriptor = frame.name or frame.url or "main frame"
+            print(f"Two-factor challenge detected using selector '{selector}' in frame '{frame_descriptor}'.")
 
-        for code_attempt in range(1, 4):
-            code = await prompt_for_two_factor_code(login_attempt, code_attempt)
-            if not code:
-                print("No code entered; aborting this attempt.")
-                return False
+            for code_attempt in range(1, 4):
+                code = await prompt_for_two_factor_code(login_attempt, code_attempt)
+                if not code:
+                    print("No code entered; aborting this attempt.")
+                    return False
 
-            await field.first.fill(code)
+                try:
+                    await frame.locator(selector).first.fill(code)
+                except Exception as exc:
+                    print(f"Unable to populate two-factor code using selector '{selector}': {exc}")
+                    exc_message = str(exc).lower()
+                    if "frame" in exc_message and "detach" in exc_message or "execution context was destroyed" in exc_message:
+                        if await wait_for_two_factor_transition(page, frame, selector, timeout_ms=7000):
+                            print("Two-factor verification succeeded after frame change.")
+                            return True
+                    continue
 
-            submitted = False
-            for submit_selector in TWO_FACTOR_SUBMIT_SELECTORS:
-                submit_button = page.locator(submit_selector)
-                if await submit_button.count():
-                    await submit_button.first.click()
-                    submitted = True
-                    break
+                submitted = False
+                for submit_selector in TWO_FACTOR_SUBMIT_SELECTORS:
+                    submit_button = frame.locator(submit_selector)
+                    try:
+                        if await submit_button.count():
+                            await submit_button.first.click()
+                            submitted = True
+                            break
+                    except PlaywrightTimeoutError:
+                        continue
+                    except Exception as exc:
+                        print(f"Attempt to click submit selector '{submit_selector}' failed: {exc}")
+                        continue
 
-            if not submitted:
-                print("No obvious submit button found for 2FA; waiting for page to react.")
+                if not submitted:
+                    print("No obvious submit button found for 2FA; sending Enter key to trigger submission.")
+                    with contextlib.suppress(Exception):
+                        await frame.locator(selector).first.press("Enter")
+                        submitted = True
 
-            if await wait_for_two_factor_transition(page, selector, timeout_ms=20000):
-                print("Two-factor verification succeeded.")
-                return True
+                if await wait_for_two_factor_transition(page, frame, selector, timeout_ms=20000):
+                    print("Two-factor verification succeeded.")
+                    return True
 
-            print("Two-factor verification did not succeed; retrying code entry...")
+                print("Two-factor verification did not succeed; retrying code entry...")
 
-        print("Maximum 2FA attempts reached for this login try.")
-        return False
+            print("Maximum 2FA attempts reached for this login try.")
+            return False
 
     return False
 
@@ -337,7 +434,7 @@ async def navigate_to_anti_harassment_training(page: Page) -> None:
         active_page,
         "'Anti-Harassment Employee Training' option",
         anti_harassment_locators,
-        timeout_ms=15000,
+        click_timeout_ms=15000,
         popup_timeout_ms=15000,
     )
 
